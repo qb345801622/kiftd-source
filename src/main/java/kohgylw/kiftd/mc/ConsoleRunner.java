@@ -1,6 +1,8 @@
 package kohgylw.kiftd.mc;
 
 import kohgylw.kiftd.server.ctl.*;
+import kohgylw.kiftd.server.exception.FilesTotalOutOfLimitException;
+import kohgylw.kiftd.server.exception.FoldersTotalOutOfLimitException;
 import kohgylw.kiftd.server.model.Node;
 
 import java.io.File;
@@ -187,10 +189,10 @@ public class ConsoleRunner {
 	private void awaiting() {
 		Thread t = new Thread(() -> {
 			reader = new Scanner(System.in);
-			System.out.println("命令帮助：\r\n" + commandTips + "\r\n");
+			Printer.instance.print("命令帮助：\r\n" + commandTips + "\r\n");
 			try {
 				while (true) {
-					System.out.print("kiftd: console$ ");
+					Printer.instance.print("kiftd: console$ ");
 					String command = new String(reader.nextLine().getBytes("UTF-8"), "UTF-8");
 					switch (command) {
 					case "-start":
@@ -303,7 +305,12 @@ public class ConsoleRunner {
 	// 打印当前文件夹内容（ls）
 	private void showCurrentFolder() {
 		try {
-			currentFolder = FileSystemManager.getInstance().getFolderView(currentFolder.getCurrent().getFolderId());
+			String folderId = currentFolder.getCurrent().getFolderId();
+			if (Math.max(FileSystemManager.getInstance().getFilesTotalNumByFoldersId(folderId),
+					FileSystemManager.getInstance().getFoldersTotalNumByFoldersId(folderId)) > Integer.MAX_VALUE) {
+				System.out.println("警告：文件夹列表长度超过最大限值，只能显示前" + Integer.MAX_VALUE + "行。");
+			}
+			currentFolder = FileSystemManager.getInstance().getFolderView(folderId);
 		} catch (SQLException e) {
 			openFolderError();
 		}
@@ -505,7 +512,11 @@ public class ConsoleRunner {
 			FileSystemManager.getInstance().importFrom(importFiles, targetFolder, type);
 			pl.c = false;
 			Printer.instance.print("导入完成。");
-		} catch (Exception e) {
+		} catch (FilesTotalOutOfLimitException e1) {
+			Printer.instance.print("错误：导入失败，该文件夹内的文件数目已达上限，无法导入更多文件。");
+		} catch (FoldersTotalOutOfLimitException e2) {
+			Printer.instance.print("错误：导入失败，该文件夹内的文件夹数目已达上限，无法导入更多文件夹。");
+		} catch (Exception e3) {
 			Printer.instance.print("错误：无法导入该文件（或文件夹），请重试。");
 		}
 	}
@@ -534,7 +545,7 @@ public class ConsoleRunner {
 				return;
 			}
 			if (!path.isDirectory()) {
-				Printer.instance.print("错误：导出路径（" + exportPath + "）必须是一个文件夹。");
+				Printer.instance.print("错误：导出路径（" + exportPath + "）必须指向一个已经存在的文件夹。");
 				return;
 			}
 			if (target == null) {

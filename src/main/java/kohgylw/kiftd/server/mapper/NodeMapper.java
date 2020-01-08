@@ -5,7 +5,35 @@ import java.util.*;
 
 public interface NodeMapper
 {
+	/**
+	 * 
+	 * <h2>根据文件夹ID查询其中的所有文件节点</h2>
+	 * <p>该方法用于一次性将目标文件夹下的全部文件节点查询出来，如果超过限值，则只查询限值内的节点数量。</p>
+	 * @author 青阳龙野(kohgylw)
+	 * @param pfid java.lang.String 目标文件夹ID
+	 * @return java.util.List 文件节点列表
+	 */
     List<Node> queryByParentFolderId(final String pfid);
+    
+    /**
+     * 
+     * <h2>按照父文件夹的ID查找其下的所有文件（分页）</h2>
+     * <p>该方法需要传入一个Map作为查询条件，其中需要包含pid（父文件夹的ID），offset（起始偏移），rows（查询行数）。</p>
+     * @author 青阳龙野(kohgylw)
+     * @param keyMap java.util.Map 封装查询条件的Map对象
+     * @return java.util.List 查询结果
+     */
+    List<Node> queryByParentFolderIdSection(final Map<String, Object> keyMap);
+    
+    /**
+     * 
+     * <h2>按照父文件夹的ID统计其下的所有文件数目</h2>
+     * <p>该方法主要用于配合queryByParentFolderIdSection方法实现分页加载。</p>
+     * @author 青阳龙野(kohgylw)
+     * @param pfid java.lang.String 父文件夹ID
+     * @return long 文件总数
+     */
+    long countByParentFolderId(final String pfid);
     
     int insert(final Node f);
     
@@ -19,10 +47,16 @@ public interface NodeMapper
     
     int updateFileNameById(final Map<String, String> map);
     
-    List<Node> queryAll();
-    
     Node queryByPath(final String path);
     
+    /**
+	 * 
+	 * <h2>查询与目标文件节点处于同一文件夹下的全部文件节点</h2>
+	 * <p>该方法用于一次性将与目标文件同文件夹的文件节点查询出来，如果超过限值，则只查询限值内的节点数量。</p>
+	 * @author 青阳龙野(kohgylw)
+	 * @param fileId java.lang.String 目标文件ID
+	 * @return java.util.List 文件节点列表
+	 */
     List<Node> queryBySomeFolder(final String fileId);
     
     /**

@@ -7,8 +7,8 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
 import java.io.RandomAccessFile;
-import java.util.Date;
 
 import javax.annotation.Resource;
 import javax.servlet.ServletOutputStream;
@@ -26,10 +26,13 @@ import kohgylw.kiftd.server.model.Node;
 import kohgylw.kiftd.server.pojo.VideoTranscodeThread;
 import kohgylw.kiftd.server.service.ResourceService;
 import kohgylw.kiftd.server.util.ConfigureReader;
+import kohgylw.kiftd.server.util.ContentTypeMap;
 import kohgylw.kiftd.server.util.Docx2PDFUtil;
 import kohgylw.kiftd.server.util.FileBlockUtil;
 import kohgylw.kiftd.server.util.FolderUtil;
+import kohgylw.kiftd.server.util.KiftdFFMPEGLocator;
 import kohgylw.kiftd.server.util.LogUtil;
+import kohgylw.kiftd.server.util.NoticeUtil;
 import kohgylw.kiftd.server.util.PowerPoint2PDFUtil;
 import kohgylw.kiftd.server.util.Txt2PDFUtil;
 import kohgylw.kiftd.server.util.TxtCharsetGetter;
@@ -59,6 +62,12 @@ public class ResourceServiceImpl implements ResourceService {
 	private FolderMapper fm;
 	@Resource
 	private TxtCharsetGetter tcg;
+	@Resource
+	private NoticeUtil nu;
+	@Resource
+	private ContentTypeMap ctm;
+	@Resource
+	private KiftdFFMPEGLocator kfl;
 
 	// 提供资源的输出流，原理与下载相同，但是个别细节有区别
 	@Override
@@ -78,7 +87,7 @@ public class ResourceServiceImpl implements ResourceService {
 						if (n.getFileName().indexOf(".") >= 0) {
 							suffix = n.getFileName().substring(n.getFileName().lastIndexOf(".")).trim().toLowerCase();
 						}
-						String contentType = "application/octet-stream";
+						String contentType = ctm.getContentType(suffix);
 						switch (suffix) {
 						case ".mp4":
 						case ".webm":
@@ -87,29 +96,25 @@ public class ResourceServiceImpl implements ResourceService {
 						case ".wmv":
 						case ".mkv":
 						case ".flv":
-							contentType = "video/mp4";
-							synchronized (VideoTranscodeUtil.videoTranscodeThreads) {
-								VideoTranscodeThread vtt = VideoTranscodeUtil.videoTranscodeThreads.get(fid);
-								if (vtt != null) {// 针对需要转码的视频（在转码列表中存在）
-									File f = new File(ConfigureReader.instance().getTemporaryfilePath(),
-											vtt.getOutputFileName());
-									if (f.isFile() && vtt.getProgress().equals("FIN")) {// 判断是否转码成功
-										file = f;// 成功，则播放它
-									} else {
-										try {
-											response.sendError(500);// 否则，返回处理失败
-										} catch (IOException e) {
+							if (kfl.getFFMPEGExecutablePath() != null) {
+								contentType = "video/mp4";
+								synchronized (VideoTranscodeUtil.videoTranscodeThreads) {
+									VideoTranscodeThread vtt = VideoTranscodeUtil.videoTranscodeThreads.get(fid);
+									if (vtt != null) {// 针对需要转码的视频（在转码列表中存在）
+										File f = new File(ConfigureReader.instance().getTemporaryfilePath(),
+												vtt.getOutputFileName());
+										if (f.isFile() && vtt.getProgress().equals("FIN")) {// 判断是否转码成功
+											file = f;// 成功，则播放它
+										} else {
+											try {
+												response.sendError(500);// 否则，返回处理失败
+											} catch (IOException e) {
+											}
+											return;
 										}
-										return;
 									}
 								}
 							}
-							break;
-						case ".mp3":
-							contentType = "audio/mpeg";
-							break;
-						case ".ogg":
-							contentType = "audio/ogg";
 							break;
 						default:
 							break;
@@ -154,8 +159,9 @@ public class ResourceServiceImpl implements ResourceService {
 			byte[] buffer = new byte[ConfigureReader.instance().getBuffSize()];
 			response.setContentType(contentType);
 			response.setHeader("Accept-Ranges", "bytes");
-			response.setHeader("ETag", fname);
-			response.setHeader("Last-Modified", new Date().toString());
+			String lastModified = resource.lastModified() + "";
+			response.setHeader("ETag", lastModified);
+			response.setHeader("Last-Modified", lastModified);
 			// 第一次请求只返回content length来让客户端请求多次实际数据
 			if (range == null) {
 				response.setHeader("Content-length", contentLength + "");
@@ -290,13 +296,15 @@ public class ResourceServiceImpl implements ResourceService {
 
 	@Override
 	public String getVideoTranscodeStatus(HttpServletRequest request) {
-		String fId = request.getParameter("fileId");
-		if (fId != null) {
-			try {
-				return vtu.getTranscodeProcess(fId);
-			} catch (Exception e) {
-				Printer.instance.print(e.getMessage());
-				lu.writeException(e);
+		if (kfl.getFFMPEGExecutablePath() != null) {
+			String fId = request.getParameter("fileId");
+			if (fId != null) {
+				try {
+					return vtu.getTranscodeProcess(fId);
+				} catch (Exception e) {
+					Printer.instance.print("错误：视频转码功能出现意外错误。详细信息：" + e.getMessage());
+					lu.writeException(e);
+				}
 			}
 		}
 		return "ERROR";
@@ -351,7 +359,7 @@ public class ResourceServiceImpl implements ResourceService {
 	}
 
 	@Override
-	public void getLRContextByUTF8(String fileId,HttpServletRequest request, HttpServletResponse response) {
+	public void getLRContextByUTF8(String fileId, HttpServletRequest request, HttpServletResponse response) {
 		final String account = (String) request.getSession().getAttribute("ACCOUNT");
 		// 权限检查
 		if (fileId != null) {
@@ -373,24 +381,24 @@ public class ResourceServiceImpl implements ResourceService {
 							// 执行转换并写出输出流
 							try {
 								String inputFileEncode = tcg.getTxtCharset(new FileInputStream(file));
-						        BufferedReader bufferedReader = new BufferedReader(
-						                new InputStreamReader(new FileInputStream(file), inputFileEncode));
-						        BufferedWriter bufferedWriter = new BufferedWriter(
-						                new OutputStreamWriter(response.getOutputStream(), "UTF-8"));
-						        String line;
-						        while ((line = bufferedReader.readLine()) != null) {
-						            bufferedWriter.write(line);
-						            bufferedWriter.newLine();
-						        }
-						        bufferedWriter.close();
-						        bufferedReader.close();
+								BufferedReader bufferedReader = new BufferedReader(
+										new InputStreamReader(new FileInputStream(file), inputFileEncode));
+								BufferedWriter bufferedWriter = new BufferedWriter(
+										new OutputStreamWriter(response.getOutputStream(), "UTF-8"));
+								String line;
+								while ((line = bufferedReader.readLine()) != null) {
+									bufferedWriter.write(line);
+									bufferedWriter.newLine();
+								}
+								bufferedWriter.close();
+								bufferedReader.close();
 								return;
 							} catch (IOException e) {
 							} catch (Exception e) {
 								Printer.instance.print(e.getMessage());
 								lu.writeException(e);
 							}
-							
+
 						}
 					}
 				}
@@ -400,6 +408,30 @@ public class ResourceServiceImpl implements ResourceService {
 			response.sendError(500);
 		} catch (Exception e1) {
 		}
+	}
+
+	@Override
+	public void getNoticeContext(HttpServletRequest request, HttpServletResponse response) {
+		File noticeHTML = new File(ConfigureReader.instance().getTemporaryfilePath(), NoticeUtil.NOTICE_OUTPUT_NAME);
+		String contentType = "text/html";
+		if (noticeHTML.isFile() && noticeHTML.canRead()) {
+			sendResource(noticeHTML, NoticeUtil.NOTICE_FILE_NAME, contentType, request, response);
+		} else {
+			try {
+				response.setContentType(contentType);
+				response.setCharacterEncoding("UTF-8");
+				PrintWriter writer = response.getWriter();
+				writer.write("<p class=\"lead\">暂无新公告。</p>");
+				writer.flush();
+				writer.close();
+			} catch (IOException e) {
+			}
+		}
+	}
+
+	@Override
+	public String getNoticeMD5() {
+		return nu.getMd5();
 	}
 
 }

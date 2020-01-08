@@ -7,7 +7,8 @@ import org.springframework.stereotype.*;
 import kohgylw.kiftd.server.mapper.*;
 import javax.annotation.*;
 import kohgylw.kiftd.server.enumeration.*;
-import kohgylw.kiftd.server.listener.CleanInvalidAddedAuthListener;
+import kohgylw.kiftd.server.exception.FoldersTotalOutOfLimitException;
+import kohgylw.kiftd.server.listener.ServerInitListener;
 import kohgylw.kiftd.server.model.*;
 import kohgylw.kiftd.server.pojo.CheckImportFolderRespons;
 import kohgylw.kiftd.server.pojo.CheckUploadFilesRespons;
@@ -37,6 +38,8 @@ import com.google.gson.reflect.TypeToken;
  */
 @Service
 public class FileServiceImpl extends RangeFileStreamWriter implements FileService {
+	private static final String FOLDERS_TOTAL_OUT_OF_LIMIT = "foldersTotalOutOfLimit";// 文件夹数量超限标识
+	private static final String FILES_TOTAL_OUT_OF_LIMIT = "filesTotalOutOfLimit";// 文件数量超限标识
 	private static final String ERROR_PARAMETER = "errorParameter";// 参数错误标识
 	private static final String NO_AUTHORIZED = "noAuthorized";// 权限错误标识
 	private static final String UPLOADSUCCESS = "uploadsuccess";// 上传成功标识
@@ -57,7 +60,7 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 
 	private static final String CONTENT_TYPE = "application/octet-stream";
 
-	// 检查上传文件列表的实现
+	// 检查上传文件列表的实现（上传文件的前置操作）
 	public String checkUploadFile(final HttpServletRequest request, final HttpServletResponse response) {
 		final String account = (String) request.getSession().getAttribute("ACCOUNT");
 		final String folderId = request.getParameter("folderId");
@@ -68,6 +71,7 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 		if (folderId == null || folderId.length() == 0) {
 			return ERROR_PARAMETER;
 		}
+		// 获取上传目标文件夹，如果没有直接返回错误
 		Folder folder = flm.queryById(folderId);
 		if (folder == null) {
 			return ERROR_PARAMETER;
@@ -112,6 +116,11 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 					.equals(new String(fileName.getBytes(Charset.forName("UTF-8")), Charset.forName("UTF-8"))))) {
 				pereFileNameList.add(fileName);
 			}
+		}
+		// 判断如果上传了这一批文件的话，会不会引起文件数量超限
+		long estimatedTotal = fm.countByParentFolderId(folderId) - pereFileNameList.size() + namelistObj.size();
+		if (estimatedTotal > FileNodeUtil.MAXIMUM_NUM_OF_SINGLE_FOLDER || estimatedTotal < 0) {
+			return "filesTotalOutOfLimit";
 		}
 		// 如果存在同名文件，则写入同名文件的列表；否则，直接允许上传
 		if (pereFileNameList.size() > 0) {
@@ -225,6 +234,10 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 				return UPLOADERROR;
 			}
 		}
+		// 判断该文件夹内的文件数量是否超限
+		if (fm.countByParentFolderId(folderId) >= FileNodeUtil.MAXIMUM_NUM_OF_SINGLE_FOLDER) {
+			return FILES_TOTAL_OUT_OF_LIMIT;
+		}
 		// 将文件存入节点并获取其存入生成路径，型如“UUID.block”形式。
 		final String path = this.fbu.saveToFileBlocks(file);
 		if (path.equals("ERROR")) {
@@ -315,7 +328,8 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 						// 执行写出
 						final File fo = this.fbu.getFileFromBlocks(f);
 						if (fo != null) {
-							writeRangeFileStream(request, response, fo, f.getFileName(), CONTENT_TYPE);
+							writeRangeFileStream(request, response, fo, f.getFileName(), CONTENT_TYPE,
+									ConfigureReader.instance().getDownloadMaxRate(account));
 							// 日志记录（仅针对一次下载）
 							if (request.getHeader("Range") == null) {
 								this.lu.writeDownloadFileEvent(request, f);
@@ -436,7 +450,7 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 				}
 			}
 			if (fidList.size() > 0) {
-				CleanInvalidAddedAuthListener.needCheck = true;
+				ServerInitListener.needCheck = true;
 			}
 			return "deleteFileSuccess";
 		} catch (Exception e) {
@@ -446,23 +460,26 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 
 	// 打包下载功能：前置——压缩要打包下载的文件
 	public String downloadCheckedFiles(final HttpServletRequest request) {
-		final String account = (String) request.getSession().getAttribute("ACCOUNT");
-		final String strIdList = request.getParameter("strIdList");
-		final String strFidList = request.getParameter("strFidList");
-		try {
-			// 获得要打包下载的文件ID
-			final List<String> idList = gson.fromJson(strIdList, new TypeToken<List<String>>() {
-			}.getType());
-			final List<String> fidList = gson.fromJson(strFidList, new TypeToken<List<String>>() {
-			}.getType());
-			// 创建ZIP压缩包并将全部文件压缩
-			if (idList.size() > 0 || fidList.size() > 0) {
-				final String zipname = this.fbu.createZip(idList, fidList, account);
-				this.lu.writeDownloadCheckedFileEvent(request, idList);
-				// 返回生成的压缩包路径
-				return zipname;
+		if (ConfigureReader.instance().isEnableDownloadByZip()) {
+			final String account = (String) request.getSession().getAttribute("ACCOUNT");
+			final String strIdList = request.getParameter("strIdList");
+			final String strFidList = request.getParameter("strFidList");
+			try {
+				// 获得要打包下载的文件ID
+				final List<String> idList = gson.fromJson(strIdList, new TypeToken<List<String>>() {
+				}.getType());
+				final List<String> fidList = gson.fromJson(strFidList, new TypeToken<List<String>>() {
+				}.getType());
+				// 创建ZIP压缩包并将全部文件压缩
+				if (idList.size() > 0 || fidList.size() > 0) {
+					final String zipname = this.fbu.createZip(idList, fidList, account);
+					this.lu.writeDownloadCheckedFileEvent(request, idList);
+					// 返回生成的压缩包路径
+					return zipname;
+				}
+			} catch (Exception ex) {
+				lu.writeException(ex);
 			}
-		} catch (Exception ex) {
 		}
 		return "ERROR";
 	}
@@ -471,58 +488,64 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 	public void downloadCheckedFilesZip(final HttpServletRequest request, final HttpServletResponse response)
 			throws Exception {
 		final String zipname = request.getParameter("zipId");
+		final String account = (String) request.getSession().getAttribute("ACCOUNT");
 		if (zipname != null && !zipname.equals("ERROR")) {
 			final String tfPath = ConfigureReader.instance().getTemporaryfilePath();
 			final File zip = new File(tfPath, zipname);
 			String fname = "kiftd_" + ServerTimeUtil.accurateToDay() + "_\u6253\u5305\u4e0b\u8f7d.zip";
 			if (zip.exists()) {
-				writeRangeFileStream(request, response, zip, fname, CONTENT_TYPE);
+				writeRangeFileStream(request, response, zip, fname, CONTENT_TYPE,
+						ConfigureReader.instance().getDownloadMaxRate(account));
 				zip.delete();
 			}
 		}
 	}
 
 	public String getPackTime(final HttpServletRequest request) {
-		final String account = (String) request.getSession().getAttribute("ACCOUNT");
-		final String strIdList = request.getParameter("strIdList");
-		final String strFidList = request.getParameter("strFidList");
-		try {
-			final List<String> idList = gson.fromJson(strIdList, new TypeToken<List<String>>() {
-			}.getType());
-			final List<String> fidList = gson.fromJson(strFidList, new TypeToken<List<String>>() {
-			}.getType());
-			for (String fid : fidList) {
-				countFolderFilesId(account, fid, fidList);
-			}
-			long packTime = 0L;
-			for (final String fid : idList) {
-				final Node n = this.fm.queryById(fid);
-				if (ConfigureReader.instance().authorized(account, AccountAuth.DOWNLOAD_FILES,
-						fu.getAllFoldersId(n.getFileParentFolder()))
-						&& ConfigureReader.instance().accessFolder(flm.queryById(n.getFileParentFolder()), account)) {
-					final File f = fbu.getFileFromBlocks(n);
-					if (f != null && f.exists()) {
-						packTime += f.length() / 25000000L;
+		if (ConfigureReader.instance().isEnableDownloadByZip()) {
+			final String account = (String) request.getSession().getAttribute("ACCOUNT");
+			final String strIdList = request.getParameter("strIdList");
+			final String strFidList = request.getParameter("strFidList");
+			try {
+				final List<String> idList = gson.fromJson(strIdList, new TypeToken<List<String>>() {
+				}.getType());
+				final List<String> fidList = gson.fromJson(strFidList, new TypeToken<List<String>>() {
+				}.getType());
+				for (String fid : fidList) {
+					countFolderFilesId(account, fid, fidList);
+				}
+				long packTime = 0L;
+				for (final String fid : idList) {
+					final Node n = this.fm.queryById(fid);
+					if (ConfigureReader.instance().authorized(account, AccountAuth.DOWNLOAD_FILES,
+							fu.getAllFoldersId(n.getFileParentFolder()))
+							&& ConfigureReader.instance().accessFolder(flm.queryById(n.getFileParentFolder()),
+									account)) {
+						final File f = fbu.getFileFromBlocks(n);
+						if (f != null && f.exists()) {
+							packTime += f.length() / 25000000L;
+						}
 					}
 				}
+				if (packTime < 4L) {
+					return "\u9a6c\u4e0a\u5b8c\u6210";
+				}
+				if (packTime >= 4L && packTime < 10L) {
+					return "\u5927\u7ea610\u79d2";
+				}
+				if (packTime >= 10L && packTime < 35L) {
+					return "\u4e0d\u5230\u534a\u5206\u949f";
+				}
+				if (packTime >= 35L && packTime < 65L) {
+					return "\u5927\u7ea61\u5206\u949f";
+				}
+				if (packTime >= 65L) {
+					return "\u8d85\u8fc7" + packTime / 60L
+							+ "\u5206\u949f\uff0c\u8017\u65f6\u8f83\u957f\uff0c\u5efa\u8bae\u76f4\u63a5\u4e0b\u8f7d";
+				}
+			} catch (Exception ex) {
+				lu.writeException(ex);
 			}
-			if (packTime < 4L) {
-				return "\u9a6c\u4e0a\u5b8c\u6210";
-			}
-			if (packTime >= 4L && packTime < 10L) {
-				return "\u5927\u7ea610\u79d2";
-			}
-			if (packTime >= 10L && packTime < 35L) {
-				return "\u4e0d\u5230\u534a\u5206\u949f";
-			}
-			if (packTime >= 35L && packTime < 65L) {
-				return "\u5927\u7ea61\u5206\u949f";
-			}
-			if (packTime >= 65L) {
-				return "\u8d85\u8fc7" + packTime / 60L
-						+ "\u5206\u949f\uff0c\u8017\u65f6\u8f83\u957f\uff0c\u5efa\u8bae\u76f4\u63a5\u4e0b\u8f7d";
-			}
-		} catch (Exception ex) {
 		}
 		return "0";
 	}
@@ -540,6 +563,7 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 		}
 	}
 
+	// 执行移动文件操作
 	@Override
 	public String doMoveFiles(HttpServletRequest request) {
 		final String strIdList = request.getParameter("strIdList");
@@ -606,6 +630,9 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 						this.lu.writeMoveFileEvent(request, node);
 						break;
 					case "both":
+						if (fm.countByParentFolderId(locationpath) >= FileNodeUtil.MAXIMUM_NUM_OF_SINGLE_FOLDER) {
+							return FILES_TOTAL_OUT_OF_LIMIT;
+						}
 						node.setFileName(FileNodeUtil.getNewNodeName(node.getFileName(),
 								fm.queryByParentFolderId(locationpath)));
 						if (fm.update(node) <= 0) {
@@ -625,6 +652,9 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 						return ERROR_PARAMETER;
 					}
 				} else {
+					if (fm.countByParentFolderId(locationpath) >= FileNodeUtil.MAXIMUM_NUM_OF_SINGLE_FOLDER) {
+						return FILES_TOTAL_OUT_OF_LIMIT;
+					}
 					Map<String, String> map = new HashMap<>();
 					map.put("fileId", node.getFileId());
 					map.put("locationpath", locationpath);
@@ -682,6 +712,9 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 						}
 						return "cannotMoveFiles";
 					case "both":
+						if (flm.countByParentId(locationpath) >= FileNodeUtil.MAXIMUM_NUM_OF_SINGLE_FOLDER) {
+							return FOLDERS_TOTAL_OUT_OF_LIMIT;
+						}
 						Map<String, String> map3 = new HashMap<>();
 						map3.put("folderId", folder.getFolderId());
 						map3.put("locationpath", locationpath);
@@ -704,6 +737,9 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 						return ERROR_PARAMETER;
 					}
 				} else {
+					if (flm.countByParentId(locationpath) >= FileNodeUtil.MAXIMUM_NUM_OF_SINGLE_FOLDER) {
+						return FOLDERS_TOTAL_OUT_OF_LIMIT;
+					}
 					Map<String, String> map = new HashMap<>();
 					map.put("folderId", folder.getFolderId());
 					map.put("locationpath", locationpath);
@@ -715,7 +751,7 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 				}
 			}
 			if (fidList.size() > 0) {
-				CleanInvalidAddedAuthListener.needCheck = true;
+				ServerInitListener.needCheck = true;
 			}
 			return "moveFilesSuccess";
 		} catch (Exception e) {
@@ -723,6 +759,7 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 		}
 	}
 
+	// 移动文件前的确认检查（可视作移动的前置操作）
 	@Override
 	public String confirmMoveFiles(HttpServletRequest request) {
 		final String strIdList = request.getParameter("strIdList");
@@ -730,6 +767,8 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 		final String locationpath = request.getParameter("locationpath");
 		final String account = (String) request.getSession().getAttribute("ACCOUNT");
 		Folder targetFolder = flm.queryById(locationpath);
+		int needMovefilesCount = 0;
+		int needMoveFoldersCount = 0;
 		if (ConfigureReader.instance().accessFolder(targetFolder, account) && ConfigureReader.instance()
 				.authorized(account, AccountAuth.MOVE_FILES, fu.getAllFoldersId(locationpath))) {
 			try {
@@ -760,6 +799,8 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 					if (fm.queryByParentFolderId(locationpath).parallelStream()
 							.anyMatch((e) -> e.getFileName().equals(node.getFileName()))) {
 						repeNodes.add(node);
+					} else {
+						needMovefilesCount++;
 					}
 				}
 				for (final String folderId : fidList) {
@@ -787,7 +828,17 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 					if (flm.queryByParentId(locationpath).parallelStream()
 							.anyMatch((e) -> e.getFolderName().equals(folder.getFolderName()))) {
 						repeFolders.add(folder);
+					} else {
+						needMoveFoldersCount++;
 					}
+				}
+				long estimateFilesTotal = fm.countByParentFolderId(locationpath) + needMovefilesCount;
+				if (estimateFilesTotal > FileNodeUtil.MAXIMUM_NUM_OF_SINGLE_FOLDER || estimateFilesTotal < 0) {
+					return FILES_TOTAL_OUT_OF_LIMIT;
+				}
+				long estimateFoldersTotal = flm.countByParentId(locationpath) + needMoveFoldersCount;
+				if (estimateFoldersTotal > FileNodeUtil.MAXIMUM_NUM_OF_SINGLE_FOLDER || estimateFoldersTotal < 0) {
+					return FOLDERS_TOTAL_OUT_OF_LIMIT;
 				}
 				if (repeNodes.size() > 0 || repeFolders.size() > 0) {
 					Map<String, List<? extends Object>> repeMap = new HashMap<>();
@@ -803,6 +854,7 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 		return NO_AUTHORIZED;
 	}
 
+	// 上传文件夹的先行检查
 	@Override
 	public String checkImportFolder(HttpServletRequest request) {
 		final String account = (String) request.getSession().getAttribute("ACCOUNT");
@@ -865,8 +917,13 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 			}
 			return gson.toJson(cifr);
 		} catch (NoSuchElementException e) {
-			// 通过所有检查，允许上传
-			cifr.setResult("permitUpload");
+			if (flm.countByParentId(folderId) >= FileNodeUtil.MAXIMUM_NUM_OF_SINGLE_FOLDER) {
+				// 检查目标文件夹内的文件夹数目是否超限
+				cifr.setResult(FOLDERS_TOTAL_OUT_OF_LIMIT);
+			} else {
+				// 通过所有检查，允许上传
+				cifr.setResult("permitUpload");
+			}
 			return gson.toJson(cifr);
 		}
 	}
@@ -929,7 +986,12 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 		}
 		// 执行创建文件夹和上传文件操作
 		for (String pName : paths) {
-			Folder newFolder = fu.createNewFolder(folderId, account, pName, folderConstraint);
+			Folder newFolder;
+			try {
+				newFolder = fu.createNewFolder(folderId, account, pName, folderConstraint);
+			} catch (FoldersTotalOutOfLimitException e1) {
+				return FOLDERS_TOTAL_OUT_OF_LIMIT;
+			}
 			if (newFolder == null) {
 				Map<String, String> key = new HashMap<String, String>();
 				key.put("parentId", folderId);
@@ -957,6 +1019,10 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 		if (files.parallelStream().anyMatch((e) -> e.getFileName().equals(fileName))) {
 			return UPLOADERROR;
 		}
+		// 判断上传数目是否超过限额
+		if (fm.countByParentFolderId(folderId) >= FileNodeUtil.MAXIMUM_NUM_OF_SINGLE_FOLDER) {
+			return FILES_TOTAL_OUT_OF_LIMIT;
+		}
 		// 将文件存入节点并获取其存入生成路径，型如“UUID.block”形式。
 		final String path = this.fbu.saveToFileBlocks(file);
 		if (path.equals("ERROR")) {
@@ -983,7 +1049,7 @@ public class FileServiceImpl extends RangeFileStreamWriter implements FileServic
 					if (hasRepeatNode(f2)) {
 						return UPLOADERROR;
 					} else {
-						this.lu.writeUploadFileEvent(request,f2, account);
+						this.lu.writeUploadFileEvent(request, f2, account);
 						return UPLOADSUCCESS;
 					}
 				}

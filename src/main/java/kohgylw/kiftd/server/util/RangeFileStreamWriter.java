@@ -40,10 +40,12 @@ public class RangeFileStreamWriter {
 	 *            java.lang.String 文件名
 	 * @param contentType
 	 *            java.lang.String HTTP Content-Type类型（用于控制客户端行为）
+	 * @param maxRate
+	 *            long 最大输出速率，以KB/s为单位，若为负数则不限制输出速率（用于限制客户端的下载速度）
 	 * @return void
 	 */
 	protected void writeRangeFileStream(HttpServletRequest request, HttpServletResponse response, File fo, String fname,
-			String contentType) {
+			String contentType, long maxRate) {
 		long fileLength = fo.length();// 文件总大小
 		long startOffset = 0; // 起始偏移量
 		boolean hasEnd = false;// 请求区间是否存在结束标识
@@ -66,9 +68,10 @@ public class RangeFileStreamWriter {
 		// 设置支持断点续传功能
 		response.setHeader("Accept-Ranges", "bytes");
 		// 针对具备断点续传性质的请求进行解析
-		if (request.getHeader("Range") != null && request.getHeader("Range").startsWith("bytes=")) {
+		String rangeTag = request.getHeader("Range");
+		if (rangeTag != null && rangeTag.startsWith("bytes=")) {
 			response.setStatus(HttpServletResponse.SC_PARTIAL_CONTENT);
-			rangeBytes = request.getHeader("Range").replaceAll("bytes=", "");
+			rangeBytes = rangeTag.replaceAll("bytes=", "");
 			if (rangeBytes.endsWith("-")) {
 				// 解析请求参数范围为仅有起始偏移量而无结束偏移量的情况
 				startOffset = Long.parseLong(rangeBytes.substring(0, rangeBytes.indexOf('-')).trim());
@@ -99,7 +102,9 @@ public class RangeFileStreamWriter {
 		byte[] buf = new byte[ConfigureReader.instance().getBuffSize()];
 		// 读取文件并写处至输出流
 		try (RandomAccessFile raf = new RandomAccessFile(fo, "r")) {
-			BufferedOutputStream out = new BufferedOutputStream(response.getOutputStream());
+			BufferedOutputStream out = maxRate >= 0
+					? new VariableSpeedBufferedOutputStream(response.getOutputStream(), maxRate, request.getSession())
+					: new BufferedOutputStream(response.getOutputStream());
 			raf.seek(startOffset);
 			if (!hasEnd) {
 				// 无结束偏移量时，将其从起始偏移量开始写到文件整体结束，如果从头开始下载，起始偏移量为0
@@ -121,6 +126,12 @@ public class RangeFileStreamWriter {
 			out.close();
 		} catch (IOException ex) {
 			// 针对任何IO异常忽略，传输失败不处理
+		} catch (IllegalArgumentException e) {
+			try {
+				response.sendError(500);
+			} catch (IOException e1) {
+				
+			}
 		}
 	}
 }

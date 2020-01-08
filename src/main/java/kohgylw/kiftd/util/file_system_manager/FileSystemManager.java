@@ -3,9 +3,11 @@ package kohgylw.kiftd.util.file_system_manager;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.Charset;
+import java.nio.file.Files;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -18,6 +20,8 @@ import java.util.List;
 import java.util.UUID;
 
 import kohgylw.kiftd.printer.Printer;
+import kohgylw.kiftd.server.exception.FilesTotalOutOfLimitException;
+import kohgylw.kiftd.server.exception.FoldersTotalOutOfLimitException;
 import kohgylw.kiftd.server.model.Node;
 import kohgylw.kiftd.server.pojo.ExtendStores;
 import kohgylw.kiftd.server.util.ConfigureReader;
@@ -45,6 +49,10 @@ public class FileSystemManager {
 	public static final String COVER = "COVER";
 	private static FileSystemManager fsm;// 唯一实例
 	private static final int BUFFER_SIZE = 4096;// 缓存大小，单位为Byte(B)
+	/**
+	 * 单文件夹内最大允许的文件夹或文件数量上限
+	 */
+	public static final int MAX_FOLDERS_OR_FILES_LIMIT = Integer.MAX_VALUE;
 
 	/**
 	 * 正在进行的操作进度，请只读勿改
@@ -61,7 +69,7 @@ public class FileSystemManager {
 	// 缓存各式各样的、基本的查询语句，功能见名称
 	private PreparedStatement selectFolderById;
 	private PreparedStatement selectNodeById;
-	private PreparedStatement selectNodeByFolderId;
+	private PreparedStatement selectNodesByFolderId;
 	private PreparedStatement selectFoldersByParentFolderId;
 	private PreparedStatement insertNode;
 	private PreparedStatement insertFolder;
@@ -69,6 +77,8 @@ public class FileSystemManager {
 	private PreparedStatement deleteFolderById;
 	private PreparedStatement updateNodeById;
 	private PreparedStatement updateFolderById;
+	private PreparedStatement countNodesByFolderId;
+	private PreparedStatement countFoldersByParentFolderId;
 
 	// 加载资源
 	private FileSystemManager() {
@@ -76,8 +86,10 @@ public class FileSystemManager {
 		try {
 			selectFolderById = c.prepareStatement("SELECT * FROM FOLDER WHERE folder_id = ?");
 			selectNodeById = c.prepareStatement("SELECT * FROM FILE WHERE file_id = ?");
-			selectNodeByFolderId = c.prepareStatement("SELECT * FROM FILE WHERE file_parent_folder = ?");
-			selectFoldersByParentFolderId = c.prepareStatement("SELECT * FROM FOLDER WHERE folder_parent = ?");
+			selectNodesByFolderId = c.prepareStatement(
+					"SELECT * FROM FILE WHERE file_parent_folder = ? LIMIT 0," + MAX_FOLDERS_OR_FILES_LIMIT);
+			selectFoldersByParentFolderId = c.prepareStatement(
+					"SELECT * FROM FOLDER WHERE folder_parent = ? LIMIT 0," + MAX_FOLDERS_OR_FILES_LIMIT);
 			insertNode = c.prepareStatement("INSERT INTO FILE VALUES(?,?,?,?,?,?,?)");
 			insertFolder = c.prepareStatement("INSERT INTO FOLDER VALUES(?,?,?,?,?,?)");
 			deleteNodeById = c.prepareStatement("DELETE FROM FILE WHERE file_id = ?");
@@ -86,6 +98,9 @@ public class FileSystemManager {
 					"UPDATE FILE SET file_name = ? , file_size = ? , file_parent_folder = ? , file_creation_date = ? , file_creator = ? , file_path = ? WHERE file_id = ?");
 			updateFolderById = c.prepareStatement(
 					"UPDATE FOLDER SET folder_name= ? , folder_creation_date = ? , folder_creator = ? , folder_parent = ? , folder_constraint = ? WHERE folder_id = ?");
+			countNodesByFolderId = c.prepareStatement("SELECT count(file_id) FROM FILE WHERE file_parent_folder = ?");
+			countFoldersByParentFolderId = c
+					.prepareStatement("SELECT count(folder_id) FROM FOLDER WHERE folder_parent = ?");
 		} catch (SQLException e) {
 			Printer.instance.print("错误：出现未知错误，文件系统解析失败，无法浏览文件。");
 		}
@@ -339,8 +354,8 @@ public class FileSystemManager {
 	// 查询指定文件夹内的所有文件节点，如无符合则返回空List
 	public List<Node> selectNodesByFolderId(String folderId) throws SQLException {
 		List<Node> nodes = new ArrayList<>();
-		selectNodeByFolderId.setString(1, folderId);
-		ResultSet r = selectNodeByFolderId.executeQuery();
+		selectNodesByFolderId.setString(1, folderId);
+		ResultSet r = selectNodesByFolderId.executeQuery();
 		while (r.next()) {
 			nodes.add(resultSetAccessNode(r));
 		}
@@ -431,12 +446,15 @@ public class FileSystemManager {
 			}
 			// 处理文件节点，有则用，没有则创建一个
 			if (node == null) {
+				if (getFilesTotalNumByFoldersId(folderId) >= MAX_FOLDERS_OR_FILES_LIMIT) {
+					throw new FilesTotalOutOfLimitException();
+				}
 				node = new Node();
 				node.setFileName(newName);
 				node.setFileId(UUID.randomUUID().toString());
 				node.setFileParentFolder(folderId);
 				String result = saveToFileBlocks(f);
-				if("ERROR".equals(result)) {
+				if ("ERROR".equals(result)) {
 					return;
 				}
 				node.setFilePath(result);
@@ -486,19 +504,25 @@ public class FileSystemManager {
 					newName = FileNodeUtil.getNewFolderName(name, folders);
 					break;
 				default:
-
 					return;
 				}
 			}
 			per = 50;
 			if (folder == null) {
+				if (getFoldersTotalNumByFoldersId(folderId) >= MAX_FOLDERS_OR_FILES_LIMIT) {
+					throw new FoldersTotalOutOfLimitException();// 如果已经超过了最大限值，那么不能继续导入文件夹。
+				}
 				folder = new Folder();
 				String nFolderId = UUID.randomUUID().toString();
 				folder.setFolderId(nFolderId);
 				folder.setFolderName(newName);
 				folder.setFolderConstraint(parent.getFolderConstraint());
 				folder.setFolderParent(folderId);
-				folder.setFolderCreator("SYS_IN");
+				if ("root".equals(parent.getFolderId())) {
+					folder.setFolderCreator("SYS_IN");
+				} else {
+					folder.setFolderCreator(parent.getFolderCreator());
+				}
 				folder.setFolderCreationDate(ServerTimeUtil.accurateToDay());
 				int i = 0;
 				while (true) {
@@ -610,10 +634,11 @@ public class FileSystemManager {
 		message = "正在删除文件：" + n.getFileName();
 		if (n != null) {
 			// 删除文件节点对应的数据块
-			if (getFileFormBlocks(n).delete()) {
+			File block = getFileFormBlocks(n);
+			if (block == null || block.delete()) {
 				per = 80;
 				// 删除节点信息
-				if (deleteNodeById(nodeId) > 0) {
+				if (deleteNodeById(nodeId) >= 0) {
 					per = 100;
 					return;
 				}
@@ -751,54 +776,95 @@ public class FileSystemManager {
 				file = new File(ConfigureReader.instance().getExtendStores().parallelStream()
 						.filter((e) -> e.getIndex() == index).findAny().get().getPath(), f.getFilePath());
 			}
-			if (file.exists() && file.isFile()) {
+			if (file.isFile()) {
 				return file;
 			}
 		} catch (Exception e) {
+			Printer.instance.print("错误：文件数据读取失败。详细信息：" + e.getMessage());
 		}
 		return null;
 	}
-	
+
 	public String saveToFileBlocks(final File f) {
 		// 如果存在扩展存储区，则优先在最大的扩展存储区中存放文件（避免占用主文件系统）
 		List<ExtendStores> ess = ConfigureReader.instance().getExtendStores();// 得到全部扩展存储区
 		if (ess.size() > 0) {// 如果存在
-			// 找到剩余容量最大的一个
-			ExtendStores maxExtendStores = Collections.max(ConfigureReader.instance().getExtendStores(),
-					new Comparator<ExtendStores>() {
-						@Override
-						public int compare(ExtendStores o1, ExtendStores o2) {
-							// TODO 自动生成的方法存根
-							return (int) (o1.getPath().getFreeSpace() - o2.getPath().getFreeSpace());
+			Collections.sort(ess, new Comparator<ExtendStores>() {
+				@Override
+				public int compare(ExtendStores o1, ExtendStores o2) {
+					try {
+						return o1.getPath().list().length - o2.getPath().list().length;
+					} catch (Exception e) {
+						try {
+							// 如果文件太多以至于超出数组上限，则换用如下统计方法
+							long dValue = Files.list(o1.getPath().toPath()).count()
+									- Files.list(o2.getPath().toPath()).count();
+							return dValue > 0L ? 1 : dValue == 0 ? 0 : -1;
+						} catch (IOException e1) {
+							return 0;
 						}
-					});
-			// 如果该存储区的空余容量大于要存放的文件
-			if (maxExtendStores.getPath().getFreeSpace() > f.length()) {
-				final String id = UUID.randomUUID().toString().replace("-", "");
-				final String path = maxExtendStores.getIndex() + "_" + id + ".block";
-				final File target = new File(maxExtendStores.getPath(), path);
-				try {
-					transferFile(f, target);// 则执行存放，并将文件命名为“{存储区编号}_{UUID}.block”的形式
-					return path;
-				} catch (Exception e) {
-
+					}
+				}
+			});
+			// 遍历这些扩展存储区，并尝试将新文件存入一个已有文件数目最少、同时容量又足够的扩展存储区中
+			for (ExtendStores es : ess) {
+				// 如果该存储区的空余容量大于要存放的文件
+				if (es.getPath().getFreeSpace() > f.length()) {
+					try {
+						File file = createNewBlock(es.getIndex() + "_", es.getPath());
+						if (file != null) {
+							transferFile(f, file);// 则执行存放，并将文件命名为“{存储区编号}_{UUID}.block”的形式
+							return file.getName();
+						} else {
+							continue;
+						}
+					} catch (IOException e) {
+						// 如果无法存入（由于体积过大或其他问题），那么继续尝试其他扩展存储区
+						continue;
+					} catch (Exception e) {
+						Printer.instance.print(e.getMessage());
+						continue;
+					}
 				}
 			}
 		}
 		// 如果不存在扩展存储区或者最大的扩展存储区无法存放目标文件，则尝试将其存放至主文件系统路径下
-		final String fileBlocks = ConfigureReader.instance().getFileBlockPath();
-		final String id = UUID.randomUUID().toString().replace("-", "");
-		final String path = "file_" + id + ".block";
-		final File target = new File(fileBlocks, path);
 		try {
-			transferFile(f, target);// 执行存放，并肩文件命名为“file_{UUID}.block”的形式
-			return path;
+			final File target = createNewBlock("file_", new File(ConfigureReader.instance().getFileBlockPath()));
+			if (target != null) {
+				transferFile(f, target);// 执行存放，并肩文件命名为“file_{UUID}.block”的形式
+				return target.getName();
+			}
 		} catch (Exception e) {
-			return "ERROR";
+			Printer.instance.print("错误：文件块生成失败，无法存入新的文件数据。详细信息：" + e.getMessage());
 		}
+		return "ERROR";
 	}
-	
-	private void transferFile(File f,File target) throws Exception{
+
+	// 生成创建一个在指定路径下名称（编号）绝对不重复的新文件块
+	private File createNewBlock(String prefix, File parent) throws IOException {
+		int appendIndex = 0;
+		int retryNum = 0;
+		String newName = prefix + UUID.randomUUID().toString().replace("-", "");
+		File newBlock = new File(parent, newName + ".block");
+		while (!newBlock.createNewFile()) {
+			if (appendIndex >= 0 && appendIndex < Integer.MAX_VALUE) {
+				newBlock = new File(parent, newName + "_" + appendIndex + ".block");
+				appendIndex++;
+			} else {
+				if (retryNum >= 5) {
+					return null;
+				} else {
+					newName = prefix + UUID.randomUUID().toString().replace("-", "");
+					newBlock = new File(parent, newName + ".block");
+					retryNum++;
+				}
+			}
+		}
+		return newBlock;
+	}
+
+	private void transferFile(File f, File target) throws Exception {
 		long size = f.length();
 		FileOutputStream fileOutputStream = new FileOutputStream(target);
 		FileInputStream fileInputStream = new FileInputStream(f);
@@ -819,5 +885,55 @@ public class FileSystemManager {
 		fileInputStream.close();
 		fileOutputStream.close();
 		return;
+	}
+
+	/**
+	 * 
+	 * <h2>根据父文件夹的ID获取其下已有文件数目</h2>
+	 * <p>
+	 * 该方法用于统计指定文件夹下的已有文件数量。应在各种存入新文件操作前先调用该方法来判断是否超过规定值。
+	 * </p>
+	 * 
+	 * @author 青阳龙野(kohgylw)
+	 * @param pfId
+	 *            java.lang.String 需要统计的文件夹ID
+	 * @return long 统计数目
+	 * @throws SQLException
+	 *             各种统计失败的原因
+	 */
+	public long getFilesTotalNumByFoldersId(String pfId) throws SQLException {
+		if (pfId != null) {
+			countNodesByFolderId.setString(1, pfId);
+			ResultSet rs = countNodesByFolderId.executeQuery();
+			if (rs.first()) {
+				return rs.getLong(1);
+			}
+		}
+		return 0L;
+	}
+
+	/**
+	 * 
+	 * <h2>根据父文件夹的ID获取其下已有文件夹数目</h2>
+	 * <p>
+	 * 该方法用于统计指定文件夹下的已有文件夹数量。应在各种创建新文件夹操作前先调用该方法来判断是否超过规定值。
+	 * </p>
+	 * 
+	 * @author 青阳龙野(kohgylw)
+	 * @param pfId
+	 *            java.lang.String 需要统计的文件夹ID
+	 * @return long 统计数目
+	 * @throws SQLException
+	 *             各种统计失败的原因
+	 */
+	public long getFoldersTotalNumByFoldersId(String pfId) throws SQLException {
+		if (pfId != null) {
+			countFoldersByParentFolderId.setString(1, pfId);
+			ResultSet rs = countFoldersByParentFolderId.executeQuery();
+			if (rs.first()) {
+				return rs.getLong(1);
+			}
+		}
+		return 0L;
 	}
 }
