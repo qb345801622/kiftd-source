@@ -84,6 +84,7 @@ public class ConfigureReader {
 	public static final int INVALID_FILE_CHAIN_SETTING = 12;
 	public static final int INVALID_IP_XFF_SETTING = 13;
 	public static final int INVALID_FFMPEG_SETTING = 14;
+	public static final int INVALID_MUST_LOGIN_SETTING = 15;
 	public static final int LEGAL_PROPERTIES = 0;
 	private static Thread accountPropertiesUpdateDaemonThread;
 	private String timeZone;
@@ -100,6 +101,7 @@ public class ConfigureReader {
 	private boolean enableDownloadByZip = true;// 是否启用“打包下载”功能
 
 	private static final int MAX_EXTENDSTORES_NUM = 255;// 扩展存储区最大数目
+	private static final String[] SYS_ACCOUNTS = { "SYS_IN", "Anonymous", "匿名用户" };// 一些系统的特殊账户
 
 	private ConfigureReader() {
 		this.propertiesStatus = -1;
@@ -155,8 +157,15 @@ public class ConfigureReader {
 	}
 
 	public boolean foundAccount(final String account) {
+		// 如果是匿名账户，那么永远不存在
 		if (account == null) {
 			return false;
+		}
+		// 一些系统内置的特殊账户名直接认为已经存在（避免新账户注册为这种账户）
+		for (String sysAccount : SYS_ACCOUNTS) {
+			if (sysAccount.equals(account)) {
+				return true;
+			}
 		}
 		final String accountPwd = this.accountp.getProperty(account + ".pwd");
 		return accountPwd != null && accountPwd.length() > 0;
@@ -521,7 +530,7 @@ public class ConfigureReader {
 			this.serverp.setProperty("FS.path",
 					(ss.getFsPath() + File.separator).equals(this.DEFAULT_FILE_SYSTEM_PATH) ? "DEFAULT"
 							: ss.getFsPath());
-			for (short i = 1; i < 32; i++) {
+			for (short i = 1; i < MAX_EXTENDSTORES_NUM; i++) {
 				this.serverp.removeProperty("FS.extend." + i);// 清空旧的扩展存储区设置
 			}
 			for (ExtendStores es : ss.getExtendStores()) {
@@ -552,10 +561,16 @@ public class ConfigureReader {
 	 */
 	private int testServerPropertiesAndEffect() {
 		Printer.instance.print("正在检查服务器配置...");
-		this.mustLogin = this.serverp.getProperty("mustLogin");
-		if (this.mustLogin == null) {
+		final String pMustLogin = this.serverp.getProperty("mustLogin");
+		if (pMustLogin == null) {
 			Printer.instance.print("警告：未找到是否必须登录配置，将采用默认值（O）。");
 			this.mustLogin = "O";
+		} else {
+			if (!"N".equals(pMustLogin) && !"O".equals(pMustLogin)) {
+				Printer.instance.print("错误：必须登入功能配置不正确（只能设置为“O”或“N”），请重新检查。");
+				return INVALID_MUST_LOGIN_SETTING;
+			}
+			this.mustLogin = pMustLogin;
 		}
 		final String ports = this.serverp.getProperty("port");
 		if (ports == null) {
@@ -566,11 +581,11 @@ public class ConfigureReader {
 				this.port = Integer.parseInt(ports);
 				if (this.port <= 0 || this.port > 65535) {
 					Printer.instance.print("错误：端口号配置不正确，必须使用1-65535之间的整数。");
-					return 1;
+					return INVALID_PORT;
 				}
 			} catch (Exception e) {
 				Printer.instance.print("错误：端口号配置不正确，必须使用1-65535之间的整数。");
-				return 1;
+				return INVALID_PORT;
 			}
 		}
 		final String logs = this.serverp.getProperty("log");
@@ -579,7 +594,8 @@ public class ConfigureReader {
 			this.log = "E";
 		} else {
 			if (!logs.equals("N") && !logs.equals("R") && !logs.equals("E")) {
-				return 2;
+				Printer.instance.print("错误：日志等级配置不正确（只能设置为“N”、“R”或“E”），请重新检查。");
+				return INVALID_LOG;
 			}
 			this.log = logs;
 		}
@@ -595,7 +611,7 @@ public class ConfigureReader {
 				this.vc = vcl;
 				break;
 			default:
-				Printer.instance.print("错误：登录验证码配置无效。");
+				Printer.instance.print("错误：登录验证码配置不正确（只能设置为“STANDARD”、“SIMP”或“CLOSE”），请重新检查。");
 				return INVALID_VC;
 			}
 		}
@@ -613,7 +629,7 @@ public class ConfigureReader {
 				this.allowChangePassword = false;
 				break;
 			default:
-				Printer.instance.print("错误：用户修改密码功能设置无效。");
+				Printer.instance.print("错误：用户修改账户密码功能配置不正确（只能设置为“Y”或“N”），请重新检查。");
 				return INVALID_CHANGE_PASSWORD_SETTING;
 			}
 		}
@@ -631,7 +647,7 @@ public class ConfigureReader {
 				this.openFileChain = false;
 				break;
 			default:
-				Printer.instance.print("错误：永久资源链接功能设置无效。");
+				Printer.instance.print("错误：永久资源链接功能配置不正确（只能设置为“OPEN”或“CLOSE”），请重新检查。");
 				return INVALID_FILE_CHAIN_SETTING;
 			}
 		}
@@ -645,11 +661,11 @@ public class ConfigureReader {
 				this.bufferSize = Integer.parseInt(bufferSizes);
 				if (this.bufferSize <= 0) {
 					Printer.instance.print("错误：缓冲区大小设置无效。");
-					return 4;
+					return INVALID_BUFFER_SIZE;
 				}
 			} catch (Exception e2) {
 				Printer.instance.print("错误：缓冲区大小设置无效。");
-				return 4;
+				return INVALID_BUFFER_SIZE;
 			}
 		}
 		// 加载主文件系统路径配置
@@ -678,12 +694,12 @@ public class ConfigureReader {
 		final File fsFile = new File(this.fileSystemPath);
 		if (!fsFile.isDirectory() || !fsFile.canRead() || !fsFile.canWrite()) {
 			Printer.instance.print("错误：文件系统路径[" + this.fileSystemPath + "]无效，该路径必须指向一个具备读写权限的文件夹。");
-			return 3;
+			return INVALID_FILE_SYSTEM_PATH;
 		}
 		for (ExtendStores es : extendStores) {
 			if (!es.getPath().isDirectory() || !es.getPath().canRead() || !es.getPath().canWrite()) {
 				Printer.instance.print("错误：扩展存储区路径[" + es.getPath().getAbsolutePath() + "]无效，该路径必须指向一个具备读写权限的文件夹。");
-				return 3;
+				return INVALID_FILE_SYSTEM_PATH;
 			}
 		}
 		for (int i = 0; i < extendStores.size() - 1; i++) {
@@ -691,7 +707,7 @@ public class ConfigureReader {
 				if (extendStores.get(i).getPath().equals(extendStores.get(j).getPath())) {
 					Printer.instance.print(
 							"错误：扩展存储区路径[" + extendStores.get(j).getPath().getAbsolutePath() + "]无效，该路径已被其他扩展存储区占用。");
-					return 3;
+					return INVALID_FILE_SYSTEM_PATH;
 				}
 			}
 		}
@@ -699,19 +715,19 @@ public class ConfigureReader {
 		final File fbFile = new File(this.fileBlockPath);
 		if (!fbFile.isDirectory() && !fbFile.mkdirs()) {
 			Printer.instance.print("错误：无法创建文件块存放区[" + this.fileBlockPath + "]。");
-			return 5;
+			return CANT_CREATE_FILE_BLOCK_PATH;
 		}
 		this.fileNodePath = this.fileSystemPath + "filenodes" + File.separator;
 		final File fnFile = new File(this.fileNodePath);
 		if (!fnFile.isDirectory() && !fnFile.mkdirs()) {
 			Printer.instance.print("错误：无法创建文件节点存放区[" + this.fileNodePath + "]。");
-			return 6;
+			return CANT_CREATE_FILE_NODE_PATH;
 		}
 		this.TFPath = this.fileSystemPath + "temporaryfiles" + File.separator;
 		final File tfFile = new File(this.TFPath);
 		if (!tfFile.isDirectory() && !tfFile.mkdirs()) {
 			Printer.instance.print("错误：无法创建临时文件存放区[" + this.TFPath + "]。");
-			return 7;
+			return CANT_CREATE_TF_PATH;
 		}
 
 		if ("true".equals(serverp.getProperty("mysql.enable"))) {
@@ -719,7 +735,7 @@ public class ConfigureReader {
 			String url = serverp.getProperty("mysql.url", "127.0.0.1/kift");
 			if (url.indexOf("/") <= 0 || url.substring(url.indexOf("/")).length() == 1) {
 				Printer.instance.print("错误：自定义数据库的URL中必须指定数据库名称。");
-				return 8;
+				return CANT_CONNECT_DB;
 			}
 			dbURL = "jdbc:mysql://" + url + "?useUnicode=true&characterEncoding=utf8";
 			dbUser = serverp.getProperty("mysql.user", "root");
@@ -735,7 +751,7 @@ public class ConfigureReader {
 			} catch (Exception e) {
 				Printer.instance.print(
 						"错误：无法连接至自定义数据库：" + dbURL + "（user=" + dbUser + ",password=" + dbPwd + "），请确重新配置MySQL数据库相关项。");
-				return 8;
+				return CANT_CONNECT_DB;
 			}
 		} else {
 			dbDriver = "org.h2.Driver";
@@ -744,39 +760,45 @@ public class ConfigureReader {
 			dbPwd = "301537gY";
 		}
 		// https支持检查及生效处理
-		if ("true".equals(serverp.getProperty("https.enable"))) {
-			File keyFile = new File(path, "https.p12");
-			if (keyFile.isFile()) {
-				httpsKeyType = "PKCS12";
-			} else {
-				keyFile = new File(path, "https.jks");
+		String enableHttps = serverp.getProperty("https.enable");
+		if (enableHttps != null) {
+			if ("true".equals(enableHttps)) {
+				File keyFile = new File(path, "https.p12");
 				if (keyFile.isFile()) {
-					httpsKeyType = "JKS";
+					httpsKeyType = "PKCS12";
 				} else {
-					Printer.instance.print(
-							"错误：无法启用https支持，因为kiftd未能找到https证书文件。您必须在应用主目录内放置PKCS12（必须命名为https.p12）或JKS（必须命名为https.jks）证书。");
-					return HTTPS_SETTING_ERROR;
+					keyFile = new File(path, "https.jks");
+					if (keyFile.isFile()) {
+						httpsKeyType = "JKS";
+					} else {
+						Printer.instance.print(
+								"错误：无法启用https支持，因为kiftd未能找到https证书文件。您必须在应用主目录内放置PKCS12（必须命名为https.p12）或JKS（必须命名为https.jks）证书。");
+						return HTTPS_SETTING_ERROR;
+					}
 				}
-			}
-			httpsKeyFile = keyFile.getAbsolutePath();
-			httpsKeyPass = serverp.getProperty("https.keypass", "");
-			String httpsports = serverp.getProperty("https.port");
-			if (httpsports == null) {
-				Printer.instance.print("警告：未找到https端口配置，将采用默认值（443）。");
-				httpsPort = 443;
-			} else {
-				try {
-					this.httpsPort = Integer.parseInt(httpsports);
-					if (httpsPort <= 0 || httpsPort > 65535) {
+				httpsKeyFile = keyFile.getAbsolutePath();
+				httpsKeyPass = serverp.getProperty("https.keypass", "");
+				String httpsports = serverp.getProperty("https.port");
+				if (httpsports == null) {
+					Printer.instance.print("警告：未找到https端口配置，将采用默认值（443）。");
+					httpsPort = 443;
+				} else {
+					try {
+						this.httpsPort = Integer.parseInt(httpsports);
+						if (httpsPort <= 0 || httpsPort > 65535) {
+							Printer.instance.print("错误：无法启用https支持，https访问端口号配置不正确。");
+							return HTTPS_SETTING_ERROR;
+						}
+					} catch (Exception e) {
 						Printer.instance.print("错误：无法启用https支持，https访问端口号配置不正确。");
 						return HTTPS_SETTING_ERROR;
 					}
-				} catch (Exception e) {
-					Printer.instance.print("错误：无法启用https支持，https访问端口号配置不正确。");
-					return HTTPS_SETTING_ERROR;
 				}
+				openHttps = true;
+			} else if (!"false".equals(enableHttps)) {
+				Printer.instance.print("错误：https支持功能的启用项配置不正确（只能设置为“true”或“false”），请重新检查。");
+				return HTTPS_SETTING_ERROR;
 			}
-			openHttps = true;
 		}
 		// 是否启用XFF解析
 		String xffConf = serverp.getProperty("IP.xff");
@@ -830,7 +852,7 @@ public class ConfigureReader {
 			enableDownloadByZip = true;
 		}
 		Printer.instance.print("检查完毕。");
-		return 0;
+		return LEGAL_PROPERTIES;
 	}
 
 	public void createDefaultServerPropertiesFile() {
@@ -947,9 +969,10 @@ public class ConfigureReader {
 	 * 
 	 * <h2>检查某一用户是否有权限访问某一文件夹</h2>
 	 * <p>
-	 * 当访问文件夹的约束等级为“公开的”（0）时，永远返回true； 当为“仅小组”（1）时， 如果文件夹创建者不为“匿名用户”且当前有登录账户，
-	 * 则比对当前登录账户与创建者的小组是否相同或登录账户是否与创建者相同，相同返回true。其余情况均返回false；
-	 * 当为“仅创建者”（2）时，如果文件夹创建者不为“匿名用户”且与当前登录账户相同，返回true，其余情况均返回false。
+	 * 当文件夹为null时，立即返回false；当访问文件夹的约束等级为“公开的”（0）时，永远返回true；当为“仅小组”（1）时，
+	 * 如果文件夹创建者不为“匿名用户”且当前有登录账户，则比对当前登录账户与创建者的小组是否相同或登录账户是否与创建者相同，
+	 * 相同返回true。其余情况均返回false；当为“仅创建者”（2）时，如果文件夹创建者不为“匿名用户”且与当前登录账户相同，
+	 * 返回true，其余情况均返回false。
 	 * </p>
 	 * 
 	 * @author 青阳龙野(kohgylw)

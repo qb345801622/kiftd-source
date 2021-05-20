@@ -40,11 +40,14 @@ public class FileBlockUtil {
 	private LogUtil lu;// 日志工具
 	@Resource
 	private FolderUtil fu;// 文件夹操作工具
-	
+
 	/**
 	 * 
 	 * <h2>清理临时文件夹</h2>
-	 * <p>该方法用于清理临时文件夹（如果临时文件夹不存在，则创建它），避免运行时产生的临时文件堆积。该方法应在服务器启动时和关闭过程中调用。</p>
+	 * <p>
+	 * 该方法用于清理临时文件夹（如果临时文件夹不存在，则创建它），避免运行时产生的临时文件堆积。该方法应在服务器启动时和关闭过程中调用。
+	 * </p>
+	 * 
 	 * @author 青阳龙野(kohgylw)
 	 */
 	public void initTempDir() {
@@ -53,16 +56,16 @@ public class FileBlockUtil {
 		if (f.isDirectory()) {
 			try {
 				Iterator<Path> listFiles = Files.newDirectoryStream(f.toPath()).iterator();
-				while(listFiles.hasNext()) {
+				while (listFiles.hasNext()) {
 					listFiles.next().toFile().delete();
 				}
 			} catch (IOException e) {
 				lu.writeException(e);
-				Printer.instance.print("错误：临时文件清理失败，请手动清理"+f.getAbsolutePath()+"文件夹内的临时文件。");
+				Printer.instance.print("错误：临时文件清理失败，请手动清理" + f.getAbsolutePath() + "文件夹内的临时文件。");
 			}
 		} else {
-			if(!f.mkdir()) {
-				Printer.instance.print("错误：无法创建临时文件夹"+f.getAbsolutePath()+"，请检查主文件系统存储路径是否可用。");
+			if (!f.mkdir()) {
+				Printer.instance.print("错误：无法创建临时文件夹" + f.getAbsolutePath() + "，请检查主文件系统存储路径是否可用。");
 			}
 		}
 	}
@@ -78,9 +81,9 @@ public class FileBlockUtil {
 	 * @author 青阳龙野(kohgylw)
 	 * @param f
 	 *            MultipartFile 上传文件对象
-	 * @return String 随机生成的保存路径，如果保存失败则返回“ERROR”
+	 * @return java.io.File 生成的文件块，如果保存失败则返回null
 	 */
-	public String saveToFileBlocks(final MultipartFile f) {
+	public File saveToFileBlocks(final MultipartFile f) {
 		// 如果存在扩展存储区，则优先在已有文件块数目最少的扩展存储区中存放文件（避免占用主文件系统）
 		List<ExtendStores> ess = ConfigureReader.instance().getExtendStores();// 得到全部扩展存储区
 		if (ess.size() > 0) {
@@ -111,7 +114,7 @@ public class FileBlockUtil {
 						File file = createNewBlock(es.getIndex() + "_", es.getPath());
 						if (file != null) {
 							f.transferTo(file);// 则执行存放，并将文件命名为“{存储区编号}_{UUID}.block”的形式
-							return file.getName();
+							return file;
 						} else {
 							continue;// 如果本处无法生成新的文件块，那么在其他路径下继续尝试
 						}
@@ -131,13 +134,13 @@ public class FileBlockUtil {
 			final File file = createNewBlock("file_", new File(ConfigureReader.instance().getFileBlockPath()));
 			if (file != null) {
 				f.transferTo(file);// 执行存放，并肩文件命名为“file_{UUID}.block”的形式
-				return file.getName();
+				return file;
 			}
 		} catch (Exception e) {
 			lu.writeException(e);
 			Printer.instance.print("错误：文件块生成失败，无法存入新的文件数据。详细信息：" + e.getMessage());
 		}
-		return "ERROR";
+		return null;
 	}
 
 	// 生成创建一个在指定路径下名称（编号）绝对不重复的新文件块
@@ -185,7 +188,8 @@ public class FileBlockUtil {
 	 * 
 	 * <h2>删除文件系统中的一个文件块</h2>
 	 * <p>
-	 * 根据传入的文件节点对象，删除其在文件系统中保存的对应文件块。
+	 * 根据传入的文件节点对象，删除其在文件系统中保存的对应文件块。仅当传入文件节点所对应的文件块不再有其他节点引用时
+	 * 才会真的进行删除操作，否则直接返回true。
 	 * </p>
 	 * 
 	 * @author 青阳龙野(kohgylw)
@@ -194,12 +198,22 @@ public class FileBlockUtil {
 	 * @return boolean 删除结果，true为成功
 	 */
 	public boolean deleteFromFileBlocks(Node f) {
-		// 获取对应的文件块对象
-		File file = getFileFromBlocks(f);
-		if (file != null) {
-			return file.delete();// 执行删除操作
+		// 检查是否还有其他节点引用相同的文件块
+		Map<String, String> map = new HashMap<>();
+		map.put("path", f.getFilePath());
+		map.put("fileId", f.getFileId());
+		List<Node> nodes = fm.queryByPathExcludeById(map);
+		if (nodes == null || nodes.isEmpty()) {
+			// 如果已经无任何节点再引用此文件块，则删除它
+			File file = getFileFromBlocks(f);// 获取对应的文件块对象
+			if (file != null) {
+				return file.delete();// 执行删除操作
+			}
+			return false;
+		} else {
+			// 如果还有，那么直接返回true即可，认为此节点的文件块已经删除了（其他的引用是属于其他节点的）
+			return true;
 		}
-		return false;
 	}
 
 	/**
@@ -262,8 +276,8 @@ public class FileBlockUtil {
 					while (blocks.hasNext()) {
 						File testBlock = blocks.next().toFile();
 						if (testBlock.isFile()) {
-							Node node = fm.queryByPath(testBlock.getName());
-							if (node == null) {
+							List<Node> nodes = fm.queryByPath(testBlock.getName());
+							if (nodes == null || nodes.isEmpty()) {
 								testBlock.delete();
 							}
 						}
@@ -442,4 +456,140 @@ public class FileBlockUtil {
 			}
 		}
 	}
+
+	/**
+	 * 
+	 * <h2>生成指定文件块资源对应的ETag标识</h2>
+	 * <p>
+	 * 该方法用于生产指定文件块的ETag标识，从而方便前端控制缓存。生成规则为：{文件最后修改时间计数}_{文件路径对应的Hash码}。
+	 * </p>
+	 * 
+	 * @author 青阳龙野(kohgylw)
+	 * @param block
+	 *            java.io.File 需要生成的文件块对象，应为文件，但也支持文件夹，或者是null
+	 * @return java.lang.String 生成的ETag值。当传入的block是null或其不存在时，返回空字符串
+	 */
+	public String getETag(File block) {
+		if (block != null && block.exists()) {
+			StringBuffer sb = new StringBuffer();
+			sb.append("\"");
+			sb.append(block.lastModified());
+			sb.append("_");
+			sb.append(block.hashCode());
+			sb.append("\"");
+			return sb.toString().trim();
+		}
+		return "\"0\"";
+	}
+
+	/**
+	 * 
+	 * <h2>插入一个新的文件节点至文件系统数据库中</h2>
+	 * <p>
+	 * 该方法将尝试生成一个新的文件节点并存入文件系统数据库，并确保该文件节点再插入后不会与已有节点产生冲突。
+	 * </p>
+	 * 
+	 * @author 青阳龙野(kohgylw)
+	 * @param fileName
+	 *            java.lang.String 文件名称
+	 * @param account
+	 *            java.lang.String 创建者账户，若传入null则按匿名创建者处理
+	 * @param filePath
+	 *            java.lang.String 文件节点对应的文件块索引
+	 * @param fileSize
+	 *            java.lang.String 文件体积
+	 * @param fileParentFolder
+	 *            java.lang.String 文件的父文件夹ID
+	 * @return kohgylw.kiftd.server.model.Node 操作成功则返回节点对象，否则返回null
+	 */
+	public Node insertNewNode(String fileName, String account, String filePath, String fileSize,
+			String fileParentFolder) {
+		final Node f2 = new Node();
+		f2.setFileId(UUID.randomUUID().toString());
+		if (account != null) {
+			f2.setFileCreator(account);
+		} else {
+			f2.setFileCreator("\u533f\u540d\u7528\u6237");
+		}
+		f2.setFileCreationDate(ServerTimeUtil.accurateToDay());
+		f2.setFileName(fileName);
+		f2.setFileParentFolder(fileParentFolder);
+		f2.setFilePath(filePath);
+		f2.setFileSize(fileSize);
+		int i = 0;
+		// 尽可能避免UUID重复的情况发生，重试10次
+		while (true) {
+			try {
+				if (this.fm.insert(f2) > 0) {
+					if (isValidNode(f2)) {
+						return f2;
+					} else {
+						break;
+					}
+				}
+				break;
+			} catch (Exception e) {
+				f2.setFileId(UUID.randomUUID().toString());
+				i++;
+			}
+			if (i >= 10) {
+				break;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * 
+	 * <h2>检查指定的文件节点是否存在同名问题</h2>
+	 * <p>
+	 * 该方法用于检查传入节点是否存在冲突问题，一般在新节点插入后执行，若存在冲突会立即删除此节点，最后会返回检查结果。
+	 * </p>
+	 * 
+	 * @author 青阳龙野(kohgylw)
+	 * @param n
+	 *            kohgylw.kiftd.server.model.Node 待检查的节点
+	 * @return boolean 通过检查则返回true，否则返回false并删除此节点
+	 */
+	public boolean isValidNode(Node n) {
+		Node[] repeats = fm.queryByParentFolderId(n.getFileParentFolder()).parallelStream()
+				.filter((e) -> e.getFileName().equals(n.getFileName())).toArray(Node[]::new);
+		if (flm.queryById(n.getFileParentFolder()) == null || repeats.length > 1) {
+			// 如果插入后存在：
+			// 1，该节点没有有效的父级文件夹（死节点）；
+			// 2，与同级的其他节点重名，
+			// 那么它就是一个无效的节点，应将插入操作撤销
+			// 所谓撤销，也就是将该节点的数据立即删除（如果有）
+			fm.deleteById(n.getFileId());
+			return false;// 返回“无效”的判定结果
+		} else {
+			return true;// 否则，该节点有效，返回结果
+		}
+	}
+
+	/**
+	 * 
+	 * <h2>获取一个节点当前的逻辑路径</h2>
+	 * <p>
+	 * 该方法用于获取指定节点当前的完整逻辑路径，型如“/ROOT/doc/test.txt”。
+	 * </p>
+	 * 
+	 * @author 青阳龙野(kohgylw)
+	 * @param n
+	 *            kohgylw.kiftd.server.model.Node 要获取路径的节点
+	 * @return java.lang.String 指定节点的逻辑路径，包含其完整的上级文件夹路径和自身的文件名，各级之间以“/”分割。
+	 */
+	public String getNodePath(Node n) {
+		Folder folder = flm.queryById(n.getFileParentFolder());
+		List<Folder> l = fu.getParentList(folder.getFolderId());
+		StringBuffer pl = new StringBuffer();
+		for (Folder i : l) {
+			pl.append(i.getFolderName() + "/");
+		}
+		pl.append(folder.getFolderName());
+		pl.append("/");
+		pl.append(n.getFileName());
+		return pl.toString();
+	}
+
 }
